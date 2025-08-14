@@ -10,12 +10,11 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 
-// Session cache עם TTL
+// Session cache
 const sessionCache = new Map();
-const SESSION_TTL = 5 * 60 * 1000; // 5 minutes
 
-// Browser args מאופטמים
-const OPTIMIZED_ARGS = [
+// Browser args
+const BROWSER_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
@@ -24,170 +23,178 @@ const OPTIMIZED_ARGS = [
   '--disable-web-security',
   '--disable-gpu',
   '--no-first-run',
-  '--no-default-browser-check',
   '--window-size=1920,1080',
-  '--single-process', // חשוב למהירות ב-Railway
-  '--disable-extensions',
-  '--disable-plugins',
-  '--disable-images',
-  '--disable-javascript-harmony-shipping',
-  '--disable-background-timer-throttling',
-  '--disable-renderer-backgrounding',
-  '--disable-features=TranslateUI',
-  '--disable-ipc-flooding-protection'
+  '--single-process'
 ];
 
-// פונקציה מהירה לעקיפת Cloudflare
-async function bypassCloudflare(page, url) {
-  console.log('🚀 Starting fast bypass for:', url);
+// פונקציה חדשה - המתנה חכמה לעקיפת Cloudflare
+async function waitForCloudflare(page, url, maxWait = 30000) {
+  console.log('🚀 Navigating to:', url);
   const startTime = Date.now();
   
   try {
-    // Navigate with shorter timeout
-    await page.goto(url, {
+    // Navigate ONCE - כניסה אחת בלבד!
+    const response = await page.goto(url, {
       waitUntil: 'domcontentloaded',
-      timeout: 20000
+      timeout: maxWait
     });
     
-    // Check for Cloudflare - אבל מהר יותר
-    let attempts = 0;
-    const maxAttempts = 5; // פחות ניסיונות
-    const waitTime = 2000; // 2 שניות במקום 3
+    console.log(`📊 Initial response: ${response?.status()}`);
     
-    while (attempts < maxAttempts) {
-      const title = await page.title();
+    // בדוק אם יש Cloudflare
+    const initialTitle = await page.title();
+    console.log(`📄 Initial title: ${initialTitle}`);
+    
+    if (initialTitle.includes('Just a moment') || 
+        initialTitle.includes('Checking your browser')) {
       
-      if (title.includes('Just a moment')) {
-        console.log(`☁️ Cloudflare detected (${attempts + 1}/${maxAttempts})`);
+      console.log('☁️ Cloudflare detected, waiting for it to resolve...');
+      
+      // המתן עד שהכותרת משתנה - זה הסימן שעברנו
+      try {
+        await page.waitForFunction(
+          () => !document.title.includes('Just a moment') && 
+                !document.title.includes('Checking your browser'),
+          {
+            timeout: 20000, // מקסימום 20 שניות
+            polling: 500 // בדוק כל חצי שנייה
+          }
+        );
         
-        // Wait shorter time
-        await page.waitForTimeout(waitTime);
+        console.log('✅ Cloudflare challenge passed!');
         
-        // Check if challenge completed
+        // המתן עוד קצת לטעינה מלאה
+        await page.waitForTimeout(1000);
+        
+      } catch (timeoutError) {
+        console.log('⏱️ Cloudflare timeout - trying alternative wait...');
+        
+        // נסה לחכות לאלמנט של Partsouq
         try {
-          // נסה לחכות לאלמנט ספציפי של Partsouq
-          await page.waitForSelector('body:not(:has-text("Just a moment"))', {
-            timeout: 3000
-          }).catch(() => {});
-        } catch (e) {
-          // Continue
+          await page.waitForSelector('.search-results, .parts-list, .product, #app, [data-testid]', {
+            timeout: 5000
+          });
+          console.log('✅ Found Partsouq content!');
+        } catch {
+          console.log('⚠️ No specific elements found, continuing anyway...');
         }
-        
-        attempts++;
-      } else {
-        // Success!
-        console.log(`✅ Bypassed in ${Date.now() - startTime}ms`);
-        break;
       }
+    } else {
+      console.log('✅ No Cloudflare detected, page loaded directly');
     }
     
+    // קח את התוכן הסופי
     const html = await page.content();
     const finalUrl = page.url();
+    const finalTitle = await page.title();
+    
+    const elapsed = Date.now() - startTime;
+    console.log(`⏱️ Total time: ${elapsed}ms`);
+    console.log(`📍 Final URL: ${finalUrl}`);
+    console.log(`📄 Final title: ${finalTitle}`);
     
     return {
       success: true,
       html: html,
       url: finalUrl,
-      elapsed: Date.now() - startTime
+      title: finalTitle,
+      elapsed: elapsed
     };
     
   } catch (error) {
-    console.error('❌ Bypass error:', error.message);
-    throw error;
+    console.error('❌ Error:', error.message);
+    return {
+      success: false,
+      error: error.message
+    };
   }
 }
 
-// פונקציה ראשית עם session reuse
-async function scrapeWithCache(url, sessionId = null) {
-  console.log(`\n📦 Session: ${sessionId || 'new'}`);
-  
-  // Check session cache
-  if (sessionId && sessionCache.has(sessionId)) {
-    const cached = sessionCache.get(sessionId);
-    if (Date.now() - cached.timestamp < SESSION_TTL) {
-      console.log('⚡ Using cached session');
-      // Continue with cached cookies
-    }
-  }
-  
+// Main scraping function
+async function scrapeUrl(url, sessionId = null) {
   let browser = null;
   let page = null;
   
   try {
-    // Launch browser - כל פעם מחדש אבל מהר
+    // Launch browser
     browser = await puppeteer.launch({
       headless: 'new',
-      args: OPTIMIZED_ARGS,
+      args: BROWSER_ARGS,
       ignoreDefaultArgs: ['--enable-automation']
     });
     
     page = await browser.newPage();
     
-    // Stealth additions
+    // Stealth measures
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, 'webdriver', {
         get: () => undefined
       });
-      window.chrome = { runtime: {} };
+      
+      window.chrome = {
+        runtime: {},
+        loadTimes: function() {},
+        csi: function() {}
+      };
+      
       Object.defineProperty(navigator, 'plugins', {
         get: () => [1, 2, 3, 4, 5]
       });
+      
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en']
+      });
+      
+      // Override permissions
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
     });
     
-    // Set viewport
+    // Set viewport and user agent
     await page.setViewport({ width: 1920, height: 1080 });
-    
-    // Set user agent
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     
-    // Block heavy resources
+    // Block resources
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const type = req.resourceType();
-      const url = req.url();
-      
-      // Block images, fonts, styles
       if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
         req.abort();
-        return;
+      } else {
+        req.continue();
       }
-      
-      // Block tracking
-      if (url.includes('google-analytics') || 
-          url.includes('doubleclick') ||
-          url.includes('facebook')) {
-        req.abort();
-        return;
-      }
-      
-      req.continue();
     });
     
-    // Load cookies if session exists
+    // Load cookies if available
     if (sessionId && sessionCache.has(sessionId)) {
-      const cached = sessionCache.get(sessionId);
-      if (cached.cookies && cached.cookies.length > 0) {
-        await page.setCookie(...cached.cookies);
-        console.log(`🍪 Loaded ${cached.cookies.length} cookies`);
+      const session = sessionCache.get(sessionId);
+      if (session.cookies && session.cookies.length > 0) {
+        await page.setCookie(...session.cookies);
+        console.log(`🍪 Loaded ${session.cookies.length} cookies from session`);
       }
     }
     
-    // Bypass Cloudflare
-    const result = await bypassCloudflare(page, url);
+    // Navigate and wait for Cloudflare
+    const result = await waitForCloudflare(page, url);
     
-    // Save cookies
-    if (sessionId) {
+    // Save cookies for next time
+    if (sessionId && result.success) {
       const cookies = await page.cookies();
       sessionCache.set(sessionId, {
         cookies: cookies,
         timestamp: Date.now()
       });
-      console.log(`💾 Saved ${cookies.length} cookies`);
+      console.log(`💾 Saved ${cookies.length} cookies to session`);
     }
     
     return result;
     
   } catch (error) {
+    console.error('Scraping error:', error);
     return {
       success: false,
       error: error.message
@@ -199,12 +206,12 @@ async function scrapeWithCache(url, sessionId = null) {
   }
 }
 
-// Main endpoint - תואם FlareSolverr
+// Main endpoint
 app.post('/v1', async (req, res) => {
   const startTime = Date.now();
   
   try {
-    const { cmd, url, maxTimeout = 30000, session } = req.body;
+    const { cmd, url, maxTimeout = 35000, session } = req.body;
     
     if (!url) {
       return res.status(400).json({
@@ -213,13 +220,14 @@ app.post('/v1', async (req, res) => {
       });
     }
     
-    console.log(`\n📨 Request: ${url}`);
+    console.log(`\n📨 New request: ${url}`);
+    console.log(`📦 Session: ${session || 'none'}`);
     
-    // Create stable session ID
-    const sessionId = session || `ps_${Buffer.from(url).toString('base64').substring(0, 10)}`;
+    // Create session ID from URL if not provided
+    const sessionId = session || `auto_${Buffer.from(url).toString('base64').substring(0, 10)}`;
     
     // Scrape with timeout
-    const scrapePromise = scrapeWithCache(url, sessionId);
+    const scrapePromise = scrapeUrl(url, sessionId);
     const timeoutPromise = new Promise((_, reject) => 
       setTimeout(() => reject(new Error('Timeout')), maxTimeout)
     );
@@ -227,7 +235,15 @@ app.post('/v1', async (req, res) => {
     const result = await Promise.race([scrapePromise, timeoutPromise]);
     
     if (result.success) {
-      console.log(`✅ Completed in ${result.elapsed}ms`);
+      console.log(`✅ Success in ${result.elapsed}ms`);
+      
+      // Check if we got real content (not Cloudflare page)
+      const isCloudflare = result.title?.includes('Just a moment') || 
+                          result.html?.includes('cf-browser-verification');
+      
+      if (isCloudflare) {
+        throw new Error('Failed to bypass Cloudflare');
+      }
       
       res.json({
         status: 'ok',
@@ -241,8 +257,9 @@ app.post('/v1', async (req, res) => {
         },
         startTimestamp: startTime,
         endTimestamp: Date.now(),
-        version: '2.0.0'
+        version: '3.0.0'
       });
+      
     } else {
       throw new Error(result.error);
     }
@@ -258,16 +275,15 @@ app.post('/v1', async (req, res) => {
   }
 });
 
-// Quick test endpoint
+// Test endpoint
 app.get('/test', async (req, res) => {
   try {
-    const result = await scrapeWithCache('https://example.com');
+    const result = await scrapeUrl('https://example.com');
     
     if (result.success) {
-      const title = result.html.match(/<title>(.*?)<\/title>/)?.[1];
       res.json({
         status: 'ok',
-        title: title,
+        title: result.title,
         elapsed: result.elapsed + 'ms'
       });
     } else {
@@ -282,7 +298,7 @@ app.get('/test', async (req, res) => {
   }
 });
 
-// Partsouq test endpoint
+// Partsouq test
 app.get('/test-partsouq', async (req, res) => {
   try {
     const vin = req.query.vin || 'NLHBB51CBEZ258560';
@@ -290,15 +306,18 @@ app.get('/test-partsouq', async (req, res) => {
     
     console.log(`\n🧪 Testing Partsouq with VIN: ${vin}`);
     
-    const result = await scrapeWithCache(url, `partsouq_${vin}`);
+    const result = await scrapeUrl(url, `partsouq_${vin}`);
     
     if (result.success) {
-      const hasProducts = result.html.includes('product') || 
-                         result.html.includes('part') ||
-                         result.html.includes(vin);
+      // Check for real content
+      const hasProducts = !result.title?.includes('Just a moment') &&
+                         (result.html.includes('product') || 
+                          result.html.includes('part') ||
+                          result.html.includes(vin));
       
       res.json({
-        status: 'ok',
+        status: hasProducts ? 'ok' : 'cloudflare_blocked',
+        title: result.title,
         elapsed: result.elapsed + 'ms',
         length: result.html.length,
         hasProducts: hasProducts,
@@ -329,23 +348,24 @@ app.get('/health', (req, res) => {
 // Root
 app.get('/', (req, res) => {
   res.send(`
-    <h1>⚡ Fast Cloudflare Bypass</h1>
-    <p>Optimized for speed!</p>
+    <h1>⚡ Smart Cloudflare Bypass</h1>
+    <p>Single navigation with smart waiting</p>
     <ul>
       <li>POST /v1 - Main endpoint</li>
       <li>GET /test-partsouq - Test Partsouq</li>
       <li>GET /health - Health check</li>
     </ul>
+    <p>Version: 3.0.0</p>
   `);
 });
 
-// Clear cache endpoint
+// Clear cache
 app.post('/clear-cache', (req, res) => {
-  const oldSize = sessionCache.size;
+  const size = sessionCache.size;
   sessionCache.clear();
   res.json({
     status: 'ok',
-    message: `Cleared ${oldSize} sessions`
+    cleared: size
   });
 });
 
@@ -353,26 +373,28 @@ app.post('/clear-cache', (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔═══════════════════════════════════════╗
-║   ⚡ Fast Cloudflare Bypass           ║
+║   ⚡ Smart Cloudflare Bypass v3       ║
 ║   Port: ${PORT}                           ║
-║   Optimized for Partsouq              ║
+║   Strategy: Single navigation         ║
+║   Wait: Smart polling                 ║
 ╚═══════════════════════════════════════╝
   `);
 });
 
-// Clean old sessions periodically
+// Clean old sessions
 setInterval(() => {
   const now = Date.now();
-  let deleted = 0;
+  const TTL = 5 * 60 * 1000; // 5 minutes
+  let cleaned = 0;
   
   for (const [key, value] of sessionCache) {
-    if (now - value.timestamp > SESSION_TTL) {
+    if (now - value.timestamp > TTL) {
       sessionCache.delete(key);
-      deleted++;
+      cleaned++;
     }
   }
   
-  if (deleted > 0) {
-    console.log(`🧹 Cleaned ${deleted} expired sessions`);
+  if (cleaned > 0) {
+    console.log(`🧹 Cleaned ${cleaned} old sessions`);
   }
-}, 60000); // Every minute
+}, 60000);
