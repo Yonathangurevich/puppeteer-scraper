@@ -1,275 +1,198 @@
 const express = require('express');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const cluster = require('cluster');
-const os = require('os');
+const BlockResourcesPlugin = require('puppeteer-extra-plugin-block-resources');
 
 // Use stealth plugin
 puppeteer.use(StealthPlugin());
+
+// Block unnecessary resources
+puppeteer.use(BlockResourcesPlugin({
+  blockedTypes: new Set(['image', 'stylesheet', 'font', 'media'])
+}));
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 
-// Browser pool - נחזיק 2 browsers מוכנים
-let browsers = [];
-const BROWSER_POOL_SIZE = 2;
-
-// Session & Page cache
+// Cache for sessions
 const sessionCache = new Map();
-const htmlCache = new Map();
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
-// אופטימיזציות קריטיות
-const FAST_BROWSER_ARGS = [
+// Browser launch options - כמו FlareSolverr
+const FLARESOLVERR_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
   '--disable-blink-features=AutomationControlled',
+  '--disable-features=IsolateOrigins,site-per-process',
+  '--disable-site-isolation-trials',
+  '--disable-web-security',
+  '--disable-features=BlockInsecurePrivateNetworkRequests',
   '--disable-gpu',
   '--no-first-run',
-  '--single-process',
-  '--disable-extensions',
-  '--disable-plugins',
-  '--disable-images', // לא טוען תמונות כלל!
-  '--disable-javascript', // נפעיל רק כשצריך
-  '--disable-background-timer-throttling',
-  '--disable-renderer-backgrounding',
-  '--disable-web-security',
-  '--disable-features=IsolateOrigins,site-per-process',
-  '--window-size=1920,1080'
+  '--no-default-browser-check',
+  '--window-size=1920,1080',
+  '--start-maximized',
+  '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 ];
 
-// Initialize browser pool
-async function initBrowserPool() {
-  console.log('🚀 Initializing browser pool...');
+async function solveCloudflare(page, url, maxWait = 30000) {
+  console.log('🔍 Navigating to:', url);
   
-  for (let i = 0; i < BROWSER_POOL_SIZE; i++) {
-    try {
-      const browser = await puppeteer.launch({
-        headless: 'new',
-        args: FAST_BROWSER_ARGS,
-        ignoreDefaultArgs: ['--enable-automation']
-      });
-      
-      browsers.push({
-        browser,
-        busy: false,
-        lastUsed: Date.now()
-      });
-      
-      console.log(`✅ Browser ${i + 1} ready`);
-    } catch (error) {
-      console.error(`Failed to launch browser ${i}:`, error);
-    }
-  }
-}
-
-// Get available browser from pool
-async function getBrowser() {
-  // Find free browser
-  let browserObj = browsers.find(b => !b.busy);
-  
-  if (!browserObj) {
-    // All busy - create new one temporarily
-    console.log('⚠️ All browsers busy, creating temporary one');
-    const browser = await puppeteer.launch({
-      headless: 'new',
-      args: FAST_BROWSER_ARGS,
-      ignoreDefaultArgs: ['--enable-automation']
+  try {
+    // Navigate to the page
+    await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: maxWait
     });
     
-    return { browser, temporary: true };
-  }
-  
-  browserObj.busy = true;
-  browserObj.lastUsed = Date.now();
-  return { browser: browserObj.browser, temporary: false, obj: browserObj };
-}
-
-// Release browser back to pool
-function releaseBrowser(browserObj) {
-  if (browserObj && !browserObj.temporary) {
-    browserObj.obj.busy = false;
-  }
-}
-
-// Fast scraping with smart Cloudflare bypass
-async function fastScrape(url, sessionId = null) {
-  const startTime = Date.now();
-  
-  // Check HTML cache first
-  const cacheKey = `html_${url}`;
-  if (htmlCache.has(cacheKey)) {
-    const cached = htmlCache.get(cacheKey);
-    if (Date.now() - cached.timestamp < CACHE_TTL) {
-      console.log('⚡ HTML cache hit!');
-      return {
-        success: true,
-        html: cached.html,
-        elapsed: 10, // מחזיר תוך 10ms!
-        fromCache: true
-      };
+    // Check for Cloudflare challenge
+    let retries = 0;
+    const maxRetries = 10;
+    
+    while (retries < maxRetries) {
+      const content = await page.content();
+      const title = await page.title();
+      
+      console.log(`⏳ Page title: ${title}`);
+      
+      // Check if Cloudflare challenge is present
+      if (title.includes('Just a moment') || 
+          content.includes('Checking your browser') ||
+          content.includes('cf-browser-verification') ||
+          content.includes('cf_chl_opt')) {
+        
+        console.log(`☁️ Cloudflare challenge detected, waiting... (${retries + 1}/${maxRetries})`);
+        
+        // Wait for Cloudflare to complete
+        await page.waitForTimeout(3000);
+        
+        // Try to wait for navigation
+        try {
+          await page.waitForNavigation({
+            waitUntil: 'domcontentloaded',
+            timeout: 5000
+          });
+        } catch (e) {
+          // Navigation might not happen, continue checking
+        }
+        
+        retries++;
+      } else {
+        console.log('✅ Page loaded successfully');
+        break;
+      }
     }
+    
+    // Final check
+    const finalContent = await page.content();
+    const finalUrl = page.url();
+    
+    console.log(`📍 Final URL: ${finalUrl}`);
+    console.log(`📊 Content length: ${finalContent.length}`);
+    
+    return {
+      success: true,
+      html: finalContent,
+      url: finalUrl,
+      status: 200
+    };
+    
+  } catch (error) {
+    console.error('❌ Error:', error.message);
+    throw error;
   }
+}
+
+async function scrapeWithSession(url, sessionId = null) {
+  console.log(`\n🚀 Starting scrape with session: ${sessionId || 'new'}`);
   
-  let browserObj = null;
+  let browser = null;
   let page = null;
   
   try {
-    // Get browser from pool
-    browserObj = await getBrowser();
-    const browser = browserObj.browser;
+    // Launch browser
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: FLARESOLVERR_ARGS,
+      ignoreDefaultArgs: ['--enable-automation'],
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
+    });
+    
+    console.log('🌐 Browser launched');
     
     // Create page
     page = await browser.newPage();
     
-    // Stealth measures
+    // Extra stealth measures
     await page.evaluateOnNewDocument(() => {
+      // Remove webdriver property
       Object.defineProperty(navigator, 'webdriver', {
         get: () => undefined
       });
-      window.chrome = { runtime: {} };
+      
+      // Add chrome object
+      window.chrome = {
+        runtime: {}
+      };
+      
+      // Add permissions
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+      
+      // Fix plugins
       Object.defineProperty(navigator, 'plugins', {
         get: () => [1, 2, 3, 4, 5]
       });
-    });
-    
-    // Set user agent
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    
-    // Block ALL resources except document
-    await page.setRequestInterception(true);
-    
-    let javascriptEnabled = false;
-    
-    page.on('request', (req) => {
-      const resourceType = req.resourceType();
-      const url = req.url();
       
-      // Block everything except main document
-      if (resourceType !== 'document' && resourceType !== 'script') {
-        req.abort();
-        return;
-      }
-      
-      // Block tracking scripts
-      if (url.includes('google-analytics') || 
-          url.includes('doubleclick') ||
-          url.includes('facebook')) {
-        req.abort();
-        return;
-      }
-      
-      req.continue();
-    });
-    
-    // Load cookies if session exists
-    if (sessionId && sessionCache.has(sessionId)) {
-      const session = sessionCache.get(sessionId);
-      if (session.cookies) {
-        await page.setCookie(...session.cookies);
-        console.log('🍪 Using session cookies');
-      }
-    }
-    
-    // Navigate - FIRST attempt without JavaScript
-    console.log('⚡ Fast navigation (no JS)...');
-    let response = await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: 10000
-    });
-    
-    // Check if we hit Cloudflare
-    let html = await page.content();
-    const needsJavaScript = html.includes('Just a moment') || 
-                           html.includes('Enable JavaScript') ||
-                           html.includes('cf-browser-verification');
-    
-    if (needsJavaScript) {
-      console.log('🔧 Cloudflare detected, enabling JavaScript...');
-      
-      // Enable JavaScript and reload
-      await page.setJavaScriptEnabled(true);
-      
-      // Navigate again with JavaScript
-      response = await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 15000
+      // Fix languages
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en']
       });
-      
-      // Wait for Cloudflare to pass
-      try {
-        await page.waitForFunction(
-          () => !document.title.includes('Just a moment'),
-          { timeout: 10000, polling: 500 }
-        );
-        
-        // Extra wait for content to load
-        await page.waitForTimeout(1000);
-        
-      } catch (e) {
-        console.log('⚠️ Cloudflare timeout, continuing...');
+    });
+    
+    // Set viewport
+    await page.setViewport({ 
+      width: 1920, 
+      height: 1080 
+    });
+    
+    // Load cookies from session if exists
+    if (sessionId && sessionCache.has(sessionId)) {
+      const cookies = sessionCache.get(sessionId);
+      if (cookies && cookies.length > 0) {
+        await page.setCookie(...cookies);
+        console.log(`🍪 Loaded ${cookies.length} cookies from session`);
       }
-      
-      html = await page.content();
     }
     
-    // Save cookies if session
+    // Solve Cloudflare and get content
+    const result = await solveCloudflare(page, url);
+    
+    // Save cookies to session
     if (sessionId) {
       const cookies = await page.cookies();
-      sessionCache.set(sessionId, {
-        cookies,
-        timestamp: Date.now()
-      });
+      sessionCache.set(sessionId, cookies);
+      console.log(`💾 Saved ${cookies.length} cookies to session`);
     }
     
-    // Cache the HTML
-    htmlCache.set(cacheKey, {
-      html,
-      timestamp: Date.now()
-    });
-    
-    // Clean old cache
-    if (htmlCache.size > 100) {
-      const firstKey = htmlCache.keys().next().value;
-      htmlCache.delete(firstKey);
-    }
-    
-    const elapsed = Date.now() - startTime;
-    console.log(`✅ Scraped in ${elapsed}ms`);
-    
-    return {
-      success: true,
-      html,
-      elapsed,
-      fromCache: false
-    };
+    return result;
     
   } catch (error) {
-    console.error('Scraping error:', error.message);
+    console.error('Scraping error:', error);
     return {
       success: false,
       error: error.message
     };
     
   } finally {
-    // Clean up
-    if (page) {
-      try {
-        await page.close();
-      } catch (e) {}
-    }
-    
-    // Release browser back to pool
-    if (browserObj) {
-      if (browserObj.temporary && browserObj.browser) {
-        await browserObj.browser.close();
-      } else {
-        releaseBrowser(browserObj);
-      }
-    }
+    if (page) await page.close();
+    if (browser) await browser.close();
   }
 }
 
@@ -278,7 +201,7 @@ app.post('/v1', async (req, res) => {
   const startTime = Date.now();
   
   try {
-    const { cmd, url, maxTimeout = 30000, session } = req.body;
+    const { cmd, url, maxTimeout = 60000, session } = req.body;
     
     if (!url) {
       return res.status(400).json({
@@ -288,32 +211,65 @@ app.post('/v1', async (req, res) => {
     }
     
     console.log(`\n📨 Request: ${url}`);
+    console.log(`📦 Session: ${session || 'none'}`);
     
-    // Create session ID
-    const sessionId = session || `auto_${Buffer.from(url).toString('base64').substring(0, 10)}`;
+    // Create session ID if provided
+    const sessionId = session || `session_${Date.now()}`;
     
     // Scrape with timeout
-    const result = await Promise.race([
-      fastScrape(url, sessionId),
-      new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Timeout')), maxTimeout)
-      )
-    ]);
+    const resultPromise = scrapeWithSession(url, sessionId);
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Timeout')), maxTimeout)
+    );
+    
+    const result = await Promise.race([resultPromise, timeoutPromise]);
     
     if (result.success) {
+      const elapsed = Date.now() - startTime;
+      console.log(`✅ Success in ${elapsed}ms`);
+      
       res.json({
         status: 'ok',
-        message: result.fromCache ? 'From cache' : 'Success',
+        message: 'Success',
         solution: {
-          url: url,
-          status: 200,
+          url: result.url,
+          status: result.status,
           response: result.html,
           cookies: [],
-          userAgent: 'Mozilla/5.0'
+          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         },
         startTimestamp: startTime,
         endTimestamp: Date.now(),
-        version: '4.0.0'
+        version: '1.0.0'
+      });
+    } else {
+      throw new Error(result.error);
+    }
+    
+  } catch (error) {
+    console.error('Request failed:', error);
+    
+    res.status(500).json({
+      status: 'error',
+      message: error.message,
+      solution: null,
+      startTimestamp: startTime,
+      endTimestamp: Date.now()
+    });
+  }
+});
+
+// Test endpoint
+app.get('/test', async (req, res) => {
+  try {
+    const result = await scrapeWithSession('https://example.com');
+    
+    if (result.success) {
+      const title = result.html.match(/<title>(.*?)<\/title>/)?.[1];
+      res.json({
+        status: 'ok',
+        title: title || 'No title',
+        length: result.html.length
       });
     } else {
       throw new Error(result.error);
@@ -322,31 +278,32 @@ app.post('/v1', async (req, res) => {
   } catch (error) {
     res.status(500).json({
       status: 'error',
-      message: error.message,
-      solution: null
+      message: error.message
     });
   }
 });
 
-// Test endpoint
+// Test Partsouq endpoint
 app.get('/test-partsouq', async (req, res) => {
   try {
-    const vin = req.query.vin || 'NLHBB51CBEZ258560';
-    const url = `https://partsouq.com/en/search/all?q=${vin}`;
-    
-    const result = await fastScrape(url, `test_${vin}`);
+    console.log('\n🧪 Testing Partsouq...');
+    const result = await scrapeWithSession(
+      'https://partsouq.com/en/search/all?q=NLHBB51CBEZ258560',
+      'test_session_' + Date.now()
+    );
     
     if (result.success) {
+      // Check if we got real content
       const hasProducts = result.html.includes('product') || 
                          result.html.includes('part') ||
-                         result.html.includes(vin);
+                         result.html.includes('NLHBB51CBEZ258560');
       
       res.json({
         status: 'ok',
-        elapsed: result.elapsed + 'ms',
-        fromCache: result.fromCache,
+        length: result.html.length,
         hasProducts: hasProducts,
-        htmlLength: result.html.length
+        url: result.url,
+        sample: result.html.substring(0, 500)
       });
     } else {
       throw new Error(result.error);
@@ -364,73 +321,47 @@ app.get('/test-partsouq', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
-    browsers: browsers.length,
-    activeBrowsers: browsers.filter(b => b.busy).length,
+    uptime: process.uptime(),
     sessions: sessionCache.size,
-    cachedPages: htmlCache.size,
-    uptime: Math.round(process.uptime()) + 's',
-    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB'
+    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + ' MB'
   });
-});
-
-// Clear cache
-app.post('/clear-cache', (req, res) => {
-  htmlCache.clear();
-  sessionCache.clear();
-  res.json({ status: 'ok', message: 'Cache cleared' });
 });
 
 // Root
 app.get('/', (req, res) => {
   res.send(`
-    <h1>⚡ Ultra-Fast Puppeteer Scraper</h1>
-    <p>Optimized for Partsouq with caching</p>
+    <h1>🚀 Puppeteer Scraper with Cloudflare Bypass</h1>
+    <p>Endpoints:</p>
     <ul>
-      <li>POST /v1 - Main endpoint</li>
-      <li>GET /test-partsouq - Test Partsouq</li>
-      <li>GET /health - System status</li>
-      <li>POST /clear-cache - Clear all caches</li>
+      <li>POST /v1 - Main scraping endpoint</li>
+      <li>GET /test - Test on example.com</li>
+      <li>GET /test-partsouq - Test on Partsouq</li>
+      <li>GET /health - Health check</li>
     </ul>
-    <p>Browser pool: ${browsers.length} browsers</p>
-    <p>Cached pages: ${htmlCache.size}</p>
   `);
 });
 
 // Start server
-async function start() {
-  await initBrowserPool();
-  
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`
-╔═══════════════════════════════════════╗
-║   ⚡ Ultra-Fast Scraper v4.0          ║
-║   Port: ${PORT}                           ║
-║   Browsers: ${BROWSER_POOL_SIZE}                         ║
-║   Strategy: Cache + Pool + Smart JS   ║
-╚═══════════════════════════════════════╝
-    `);
-  });
-}
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`
+╔════════════════════════════════════════╗
+║   🚀 Cloudflare Bypass Scraper         ║
+║   Port: ${PORT}                            ║
+║   Mode: Stealth + Session Management   ║
+╚════════════════════════════════════════╝
+  `);
+});
 
-// Cleanup browsers every 5 minutes
-setInterval(async () => {
-  for (let i = 0; i < browsers.length; i++) {
-    const b = browsers[i];
-    if (!b.busy && Date.now() - b.lastUsed > 5 * 60 * 1000) {
-      console.log(`🔄 Restarting idle browser ${i}`);
-      try {
-        await b.browser.close();
-        b.browser = await puppeteer.launch({
-          headless: 'new',
-          args: FAST_BROWSER_ARGS,
-          ignoreDefaultArgs: ['--enable-automation']
-        });
-      } catch (e) {
-        console.error('Failed to restart browser:', e);
-      }
+// Clean old sessions every 5 minutes
+setInterval(() => {
+  if (sessionCache.size > 100) {
+    const toDelete = sessionCache.size - 50;
+    let deleted = 0;
+    for (const [key] of sessionCache) {
+      if (deleted >= toDelete) break;
+      sessionCache.delete(key);
+      deleted++;
     }
+    console.log(`🧹 Cleaned ${deleted} old sessions`);
   }
 }, 5 * 60 * 1000);
-
-// Start
-start().catch(console.error);
