@@ -1,190 +1,193 @@
 const express = require('express');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const BlockResourcesPlugin = require('puppeteer-extra-plugin-block-resources');
 
 // Use stealth plugin
 puppeteer.use(StealthPlugin());
-
-// Block unnecessary resources
-puppeteer.use(BlockResourcesPlugin({
-  blockedTypes: new Set(['image', 'stylesheet', 'font', 'media'])
-}));
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 
-// Cache for sessions
+// Session cache עם TTL
 const sessionCache = new Map();
+const SESSION_TTL = 5 * 60 * 1000; // 5 minutes
 
-// Browser launch options - כמו FlareSolverr
-const FLARESOLVERR_ARGS = [
+// Browser args מאופטמים
+const OPTIMIZED_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
   '--disable-blink-features=AutomationControlled',
   '--disable-features=IsolateOrigins,site-per-process',
-  '--disable-site-isolation-trials',
   '--disable-web-security',
-  '--disable-features=BlockInsecurePrivateNetworkRequests',
   '--disable-gpu',
   '--no-first-run',
   '--no-default-browser-check',
   '--window-size=1920,1080',
-  '--start-maximized',
-  '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  '--single-process', // חשוב למהירות ב-Railway
+  '--disable-extensions',
+  '--disable-plugins',
+  '--disable-images',
+  '--disable-javascript-harmony-shipping',
+  '--disable-background-timer-throttling',
+  '--disable-renderer-backgrounding',
+  '--disable-features=TranslateUI',
+  '--disable-ipc-flooding-protection'
 ];
 
-async function solveCloudflare(page, url, maxWait = 30000) {
-  console.log('🔍 Navigating to:', url);
+// פונקציה מהירה לעקיפת Cloudflare
+async function bypassCloudflare(page, url) {
+  console.log('🚀 Starting fast bypass for:', url);
+  const startTime = Date.now();
   
   try {
-    // Navigate to the page
+    // Navigate with shorter timeout
     await page.goto(url, {
       waitUntil: 'domcontentloaded',
-      timeout: maxWait
+      timeout: 20000
     });
     
-    // Check for Cloudflare challenge
-    let retries = 0;
-    const maxRetries = 10;
+    // Check for Cloudflare - אבל מהר יותר
+    let attempts = 0;
+    const maxAttempts = 5; // פחות ניסיונות
+    const waitTime = 2000; // 2 שניות במקום 3
     
-    while (retries < maxRetries) {
-      const content = await page.content();
+    while (attempts < maxAttempts) {
       const title = await page.title();
       
-      console.log(`⏳ Page title: ${title}`);
-      
-      // Check if Cloudflare challenge is present
-      if (title.includes('Just a moment') || 
-          content.includes('Checking your browser') ||
-          content.includes('cf-browser-verification') ||
-          content.includes('cf_chl_opt')) {
+      if (title.includes('Just a moment')) {
+        console.log(`☁️ Cloudflare detected (${attempts + 1}/${maxAttempts})`);
         
-        console.log(`☁️ Cloudflare challenge detected, waiting... (${retries + 1}/${maxRetries})`);
+        // Wait shorter time
+        await page.waitForTimeout(waitTime);
         
-        // Wait for Cloudflare to complete
-        await page.waitForTimeout(3000);
-        
-        // Try to wait for navigation
+        // Check if challenge completed
         try {
-          await page.waitForNavigation({
-            waitUntil: 'domcontentloaded',
-            timeout: 5000
-          });
+          // נסה לחכות לאלמנט ספציפי של Partsouq
+          await page.waitForSelector('body:not(:has-text("Just a moment"))', {
+            timeout: 3000
+          }).catch(() => {});
         } catch (e) {
-          // Navigation might not happen, continue checking
+          // Continue
         }
         
-        retries++;
+        attempts++;
       } else {
-        console.log('✅ Page loaded successfully');
+        // Success!
+        console.log(`✅ Bypassed in ${Date.now() - startTime}ms`);
         break;
       }
     }
     
-    // Final check
-    const finalContent = await page.content();
+    const html = await page.content();
     const finalUrl = page.url();
-    
-    console.log(`📍 Final URL: ${finalUrl}`);
-    console.log(`📊 Content length: ${finalContent.length}`);
     
     return {
       success: true,
-      html: finalContent,
+      html: html,
       url: finalUrl,
-      status: 200
+      elapsed: Date.now() - startTime
     };
     
   } catch (error) {
-    console.error('❌ Error:', error.message);
+    console.error('❌ Bypass error:', error.message);
     throw error;
   }
 }
 
-async function scrapeWithSession(url, sessionId = null) {
-  console.log(`\n🚀 Starting scrape with session: ${sessionId || 'new'}`);
+// פונקציה ראשית עם session reuse
+async function scrapeWithCache(url, sessionId = null) {
+  console.log(`\n📦 Session: ${sessionId || 'new'}`);
+  
+  // Check session cache
+  if (sessionId && sessionCache.has(sessionId)) {
+    const cached = sessionCache.get(sessionId);
+    if (Date.now() - cached.timestamp < SESSION_TTL) {
+      console.log('⚡ Using cached session');
+      // Continue with cached cookies
+    }
+  }
   
   let browser = null;
   let page = null;
   
   try {
-    // Launch browser
+    // Launch browser - כל פעם מחדש אבל מהר
     browser = await puppeteer.launch({
       headless: 'new',
-      args: FLARESOLVERR_ARGS,
-      ignoreDefaultArgs: ['--enable-automation'],
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
+      args: OPTIMIZED_ARGS,
+      ignoreDefaultArgs: ['--enable-automation']
     });
     
-    console.log('🌐 Browser launched');
-    
-    // Create page
     page = await browser.newPage();
     
-    // Extra stealth measures
+    // Stealth additions
     await page.evaluateOnNewDocument(() => {
-      // Remove webdriver property
       Object.defineProperty(navigator, 'webdriver', {
         get: () => undefined
       });
-      
-      // Add chrome object
-      window.chrome = {
-        runtime: {}
-      };
-      
-      // Add permissions
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications' ?
-          Promise.resolve({ state: Notification.permission }) :
-          originalQuery(parameters)
-      );
-      
-      // Fix plugins
+      window.chrome = { runtime: {} };
       Object.defineProperty(navigator, 'plugins', {
         get: () => [1, 2, 3, 4, 5]
-      });
-      
-      // Fix languages
-      Object.defineProperty(navigator, 'languages', {
-        get: () => ['en-US', 'en']
       });
     });
     
     // Set viewport
-    await page.setViewport({ 
-      width: 1920, 
-      height: 1080 
+    await page.setViewport({ width: 1920, height: 1080 });
+    
+    // Set user agent
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    
+    // Block heavy resources
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const type = req.resourceType();
+      const url = req.url();
+      
+      // Block images, fonts, styles
+      if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
+        req.abort();
+        return;
+      }
+      
+      // Block tracking
+      if (url.includes('google-analytics') || 
+          url.includes('doubleclick') ||
+          url.includes('facebook')) {
+        req.abort();
+        return;
+      }
+      
+      req.continue();
     });
     
-    // Load cookies from session if exists
+    // Load cookies if session exists
     if (sessionId && sessionCache.has(sessionId)) {
-      const cookies = sessionCache.get(sessionId);
-      if (cookies && cookies.length > 0) {
-        await page.setCookie(...cookies);
-        console.log(`🍪 Loaded ${cookies.length} cookies from session`);
+      const cached = sessionCache.get(sessionId);
+      if (cached.cookies && cached.cookies.length > 0) {
+        await page.setCookie(...cached.cookies);
+        console.log(`🍪 Loaded ${cached.cookies.length} cookies`);
       }
     }
     
-    // Solve Cloudflare and get content
-    const result = await solveCloudflare(page, url);
+    // Bypass Cloudflare
+    const result = await bypassCloudflare(page, url);
     
-    // Save cookies to session
+    // Save cookies
     if (sessionId) {
       const cookies = await page.cookies();
-      sessionCache.set(sessionId, cookies);
-      console.log(`💾 Saved ${cookies.length} cookies to session`);
+      sessionCache.set(sessionId, {
+        cookies: cookies,
+        timestamp: Date.now()
+      });
+      console.log(`💾 Saved ${cookies.length} cookies`);
     }
     
     return result;
     
   } catch (error) {
-    console.error('Scraping error:', error);
     return {
       success: false,
       error: error.message
@@ -196,12 +199,12 @@ async function scrapeWithSession(url, sessionId = null) {
   }
 }
 
-// Main endpoint - FlareSolverr compatible
+// Main endpoint - תואם FlareSolverr
 app.post('/v1', async (req, res) => {
   const startTime = Date.now();
   
   try {
-    const { cmd, url, maxTimeout = 60000, session } = req.body;
+    const { cmd, url, maxTimeout = 30000, session } = req.body;
     
     if (!url) {
       return res.status(400).json({
@@ -211,65 +214,61 @@ app.post('/v1', async (req, res) => {
     }
     
     console.log(`\n📨 Request: ${url}`);
-    console.log(`📦 Session: ${session || 'none'}`);
     
-    // Create session ID if provided
-    const sessionId = session || `session_${Date.now()}`;
+    // Create stable session ID
+    const sessionId = session || `ps_${Buffer.from(url).toString('base64').substring(0, 10)}`;
     
     // Scrape with timeout
-    const resultPromise = scrapeWithSession(url, sessionId);
+    const scrapePromise = scrapeWithCache(url, sessionId);
     const timeoutPromise = new Promise((_, reject) => 
       setTimeout(() => reject(new Error('Timeout')), maxTimeout)
     );
     
-    const result = await Promise.race([resultPromise, timeoutPromise]);
+    const result = await Promise.race([scrapePromise, timeoutPromise]);
     
     if (result.success) {
-      const elapsed = Date.now() - startTime;
-      console.log(`✅ Success in ${elapsed}ms`);
+      console.log(`✅ Completed in ${result.elapsed}ms`);
       
       res.json({
         status: 'ok',
         message: 'Success',
         solution: {
           url: result.url,
-          status: result.status,
+          status: 200,
           response: result.html,
           cookies: [],
-          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          userAgent: 'Mozilla/5.0'
         },
         startTimestamp: startTime,
         endTimestamp: Date.now(),
-        version: '1.0.0'
+        version: '2.0.0'
       });
     } else {
       throw new Error(result.error);
     }
     
   } catch (error) {
-    console.error('Request failed:', error);
+    console.error('❌ Request failed:', error.message);
     
     res.status(500).json({
       status: 'error',
       message: error.message,
-      solution: null,
-      startTimestamp: startTime,
-      endTimestamp: Date.now()
+      solution: null
     });
   }
 });
 
-// Test endpoint
+// Quick test endpoint
 app.get('/test', async (req, res) => {
   try {
-    const result = await scrapeWithSession('https://example.com');
+    const result = await scrapeWithCache('https://example.com');
     
     if (result.success) {
       const title = result.html.match(/<title>(.*?)<\/title>/)?.[1];
       res.json({
         status: 'ok',
-        title: title || 'No title',
-        length: result.html.length
+        title: title,
+        elapsed: result.elapsed + 'ms'
       });
     } else {
       throw new Error(result.error);
@@ -283,27 +282,27 @@ app.get('/test', async (req, res) => {
   }
 });
 
-// Test Partsouq endpoint
+// Partsouq test endpoint
 app.get('/test-partsouq', async (req, res) => {
   try {
-    console.log('\n🧪 Testing Partsouq...');
-    const result = await scrapeWithSession(
-      'https://partsouq.com/en/search/all?q=NLHBB51CBEZ258560',
-      'test_session_' + Date.now()
-    );
+    const vin = req.query.vin || 'NLHBB51CBEZ258560';
+    const url = `https://partsouq.com/en/search/all?q=${vin}`;
+    
+    console.log(`\n🧪 Testing Partsouq with VIN: ${vin}`);
+    
+    const result = await scrapeWithCache(url, `partsouq_${vin}`);
     
     if (result.success) {
-      // Check if we got real content
       const hasProducts = result.html.includes('product') || 
                          result.html.includes('part') ||
-                         result.html.includes('NLHBB51CBEZ258560');
+                         result.html.includes(vin);
       
       res.json({
         status: 'ok',
+        elapsed: result.elapsed + 'ms',
         length: result.html.length,
         hasProducts: hasProducts,
-        url: result.url,
-        sample: result.html.substring(0, 500)
+        url: result.url
       });
     } else {
       throw new Error(result.error);
@@ -321,47 +320,59 @@ app.get('/test-partsouq', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
-    uptime: process.uptime(),
+    uptime: Math.round(process.uptime()) + 's',
     sessions: sessionCache.size,
-    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + ' MB'
+    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB'
   });
 });
 
 // Root
 app.get('/', (req, res) => {
   res.send(`
-    <h1>🚀 Puppeteer Scraper with Cloudflare Bypass</h1>
-    <p>Endpoints:</p>
+    <h1>⚡ Fast Cloudflare Bypass</h1>
+    <p>Optimized for speed!</p>
     <ul>
-      <li>POST /v1 - Main scraping endpoint</li>
-      <li>GET /test - Test on example.com</li>
-      <li>GET /test-partsouq - Test on Partsouq</li>
+      <li>POST /v1 - Main endpoint</li>
+      <li>GET /test-partsouq - Test Partsouq</li>
       <li>GET /health - Health check</li>
     </ul>
   `);
 });
 
+// Clear cache endpoint
+app.post('/clear-cache', (req, res) => {
+  const oldSize = sessionCache.size;
+  sessionCache.clear();
+  res.json({
+    status: 'ok',
+    message: `Cleared ${oldSize} sessions`
+  });
+});
+
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
-╔════════════════════════════════════════╗
-║   🚀 Cloudflare Bypass Scraper         ║
-║   Port: ${PORT}                            ║
-║   Mode: Stealth + Session Management   ║
-╚════════════════════════════════════════╝
+╔═══════════════════════════════════════╗
+║   ⚡ Fast Cloudflare Bypass           ║
+║   Port: ${PORT}                           ║
+║   Optimized for Partsouq              ║
+╚═══════════════════════════════════════╝
   `);
 });
 
-// Clean old sessions every 5 minutes
+// Clean old sessions periodically
 setInterval(() => {
-  if (sessionCache.size > 100) {
-    const toDelete = sessionCache.size - 50;
-    let deleted = 0;
-    for (const [key] of sessionCache) {
-      if (deleted >= toDelete) break;
+  const now = Date.now();
+  let deleted = 0;
+  
+  for (const [key, value] of sessionCache) {
+    if (now - value.timestamp > SESSION_TTL) {
       sessionCache.delete(key);
       deleted++;
     }
-    console.log(`🧹 Cleaned ${deleted} old sessions`);
   }
-}, 5 * 60 * 1000);
+  
+  if (deleted > 0) {
+    console.log(`🧹 Cleaned ${deleted} expired sessions`);
+  }
+}, 60000); // Every minute
