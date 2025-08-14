@@ -1,72 +1,39 @@
+# Multi-stage build לבנייה מהירה יותר
 FROM node:20-slim AS base
 
-# Install Chrome
+# התקנת Chromium בלבד (לא Chrome!) - הרבה יותר קל ומהיר
 RUN apt-get update && apt-get install -y \
-    wget \
-    gnupg \
-    ca-certificates \
-    fonts-liberation \
-    libasound2 \
-    libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libc6 \
-    libcairo2 \
-    libcups2 \
-    libdbus-1-3 \
-    libexpat1 \
-    libfontconfig1 \
-    libgbm1 \
-    libgcc1 \
-    libglib2.0-0 \
-    libgtk-3-0 \
-    libnspr4 \
-    libnss3 \
-    libpango-1.0-0 \
-    libpangocairo-1.0-0 \
-    libstdc++6 \
-    libx11-6 \
-    libx11-xcb1 \
-    libxcb1 \
-    libxcomposite1 \
-    libxcursor1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxi6 \
-    libxrandr2 \
-    libxrender1 \
-    libxss1 \
-    libxtst6 \
-    lsb-release \
-    xdg-utils \
+    chromium \
     --no-install-recommends \
-    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/googlechrome-linux-keyring.gpg \
-    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/googlechrome-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
-    && apt-get update \
-    && apt-get install -y google-chrome-stable --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/cache/apt/*
 
+# Stage 2: Dependencies
+FROM base AS deps
 WORKDIR /app
-
-# Copy package.json ONLY (not package-lock.json)
 COPY package.json ./
 
-# Use npm install instead of npm ci
-RUN npm install --only=production
+# התקנת dependencies עם cache טוב יותר
+RUN npm install --production --no-audit --no-fund
 
-# Copy the rest
+# Stage 3: Final
+FROM base AS runner
+WORKDIR /app
+
+# העתקת dependencies מ-stage קודם
+COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# Create user
-RUN groupadd -r pptruser && useradd -r -g pptruser -G audio,video pptruser \
-    && mkdir -p /home/pptruser/Downloads \
-    && chown -R pptruser:pptruser /home/pptruser \
-    && chown -R pptruser:pptruser /app
+# יצירת user (מהיר יותר)
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nodejs && \
+    chown -R nodejs:nodejs /app
 
-USER pptruser
+USER nodejs
 
+# Chromium paths
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV NODE_ENV=production
 ENV PORT=8080
 
