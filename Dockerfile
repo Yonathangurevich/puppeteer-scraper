@@ -1,6 +1,6 @@
 FROM node:18-slim
 
-# Install dependencies for Chromium
+# Install dependencies
 RUN apt-get update && apt-get install -y \
     wget \
     ca-certificates \
@@ -41,31 +41,28 @@ RUN apt-get update && apt-get install -y \
     xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Set up working directory
 WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
 
-# Install Puppeteer and dependencies
-# This will also download Chromium
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false
-RUN npm install
-
-# Copy application files
-COPY . .
-
-# Create user to run Puppeteer
+# Create pptruser BEFORE npm install
 RUN groupadd -r pptruser && useradd -r -g pptruser -G audio,video pptruser \
     && mkdir -p /home/pptruser/Downloads \
+    && mkdir -p /home/pptruser/.cache/puppeteer \
     && chown -R pptruser:pptruser /home/pptruser \
-    && chown -R pptruser:pptruser /app \
-    && chown -R pptruser:pptruser /app/node_modules
+    && chown -R pptruser:pptruser /app
 
-# Run as non-root user
+# Switch to pptruser for npm install
 USER pptruser
 
-# Environment variables
+# Install dependencies and let Puppeteer download Chrome
+ENV PUPPETEER_CACHE_DIR=/home/pptruser/.cache/puppeteer
+RUN npm install
+
+# Copy app files
+COPY --chown=pptruser:pptruser . .
+
 ENV NODE_ENV=production
 ENV PORT=8080
 
