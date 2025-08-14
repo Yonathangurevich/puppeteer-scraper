@@ -18,95 +18,96 @@ const PORT = process.env.PORT || 8080;
 
 // Cache for sessions
 const sessionCache = new Map();
+const htmlCache = new Map(); // Cache לתוצאות
+const CACHE_TTL = 5 * 60 * 1000; // 5 דקות
 
-// Browser launch options - כמו FlareSolverr
-const FLARESOLVERR_ARGS = [
+// Browser launch options
+const BROWSER_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
   '--disable-blink-features=AutomationControlled',
   '--disable-features=IsolateOrigins,site-per-process',
-  '--disable-site-isolation-trials',
   '--disable-web-security',
-  '--disable-features=BlockInsecurePrivateNetworkRequests',
   '--disable-gpu',
   '--no-first-run',
-  '--no-default-browser-check',
   '--window-size=1920,1080',
-  '--start-maximized',
-  '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  '--single-process' // חשוב למהירות ב-Railway
 ];
 
-async function solveCloudflare(page, url, maxWait = 30000) {
-  console.log('🔍 Navigating to:', url);
+async function fastCloudflareBypass(page, url) {
+  console.log('🚀 Starting fast navigation to:', url);
+  const startTime = Date.now();
   
   try {
-    // Navigate to the page
+    // Navigate פעם אחת
     await page.goto(url, {
       waitUntil: 'domcontentloaded',
-      timeout: maxWait
+      timeout: 20000
     });
     
-    // Check for Cloudflare challenge
-    let retries = 0;
-    const maxRetries = 10;
+    // בדיקה מהירה אם יש Cloudflare
+    const title = await page.title();
+    console.log(`📄 Initial title: ${title}`);
     
-    while (retries < maxRetries) {
-      const content = await page.content();
-      const title = await page.title();
+    if (title.includes('Just a moment') || title.includes('Checking your browser')) {
+      console.log('☁️ Cloudflare detected, waiting...');
       
-      console.log(`⏳ Page title: ${title}`);
-      
-      // Check if Cloudflare challenge is present
-      if (title.includes('Just a moment') || 
-          content.includes('Checking your browser') ||
-          content.includes('cf-browser-verification') ||
-          content.includes('cf_chl_opt')) {
+      // נסה רק 3 פעמים עם המתנה קצרה
+      for (let i = 0; i < 3; i++) {
+        await page.waitForTimeout(2000); // 2 שניות במקום 3
         
-        console.log(`☁️ Cloudflare challenge detected, waiting... (${retries + 1}/${maxRetries})`);
-        
-        // Wait for Cloudflare to complete
-        await page.waitForTimeout(3000);
-        
-        // Try to wait for navigation
-        try {
-          await page.waitForNavigation({
-            waitUntil: 'domcontentloaded',
-            timeout: 5000
-          });
-        } catch (e) {
-          // Navigation might not happen, continue checking
+        const newTitle = await page.title();
+        if (!newTitle.includes('Just a moment')) {
+          console.log(`✅ Cloudflare passed after ${i + 1} attempts`);
+          break;
         }
         
-        retries++;
-      } else {
-        console.log('✅ Page loaded successfully');
-        break;
+        console.log(`⏳ Still waiting... (${i + 1}/3)`);
       }
+    } else {
+      console.log('✅ No Cloudflare detected');
     }
     
-    // Final check
-    const finalContent = await page.content();
+    const html = await page.content();
     const finalUrl = page.url();
+    const elapsed = Date.now() - startTime;
     
-    console.log(`📍 Final URL: ${finalUrl}`);
-    console.log(`📊 Content length: ${finalContent.length}`);
+    console.log(`⏱️ Completed in ${elapsed}ms`);
     
     return {
       success: true,
-      html: finalContent,
+      html: html,
       url: finalUrl,
-      status: 200
+      elapsed: elapsed
     };
     
   } catch (error) {
     console.error('❌ Error:', error.message);
-    throw error;
+    return {
+      success: false,
+      error: error.message
+    };
   }
 }
 
-async function scrapeWithSession(url, sessionId = null) {
-  console.log(`\n🚀 Starting scrape with session: ${sessionId || 'new'}`);
+async function scrapeWithCache(url, sessionId = null) {
+  // בדוק cache קודם
+  const cacheKey = `${url}_${sessionId || 'default'}`;
+  if (htmlCache.has(cacheKey)) {
+    const cached = htmlCache.get(cacheKey);
+    if (Date.now() - cached.timestamp < CACHE_TTL) {
+      console.log('⚡ Cache hit! Returning immediately');
+      return {
+        success: true,
+        html: cached.html,
+        url: cached.url,
+        fromCache: true
+      };
+    }
+  }
+  
+  console.log(`📦 Session: ${sessionId || 'new'}`);
   
   let browser = null;
   let page = null;
@@ -115,76 +116,64 @@ async function scrapeWithSession(url, sessionId = null) {
     // Launch browser
     browser = await puppeteer.launch({
       headless: 'new',
-      args: FLARESOLVERR_ARGS,
+      args: BROWSER_ARGS,
       ignoreDefaultArgs: ['--enable-automation'],
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH
     });
     
-    console.log('🌐 Browser launched');
-    
-    // Create page
     page = await browser.newPage();
     
-    // Extra stealth measures
+    // Stealth measures
     await page.evaluateOnNewDocument(() => {
-      // Remove webdriver property
       Object.defineProperty(navigator, 'webdriver', {
         get: () => undefined
       });
-      
-      // Add chrome object
-      window.chrome = {
-        runtime: {}
-      };
-      
-      // Add permissions
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications' ?
-          Promise.resolve({ state: Notification.permission }) :
-          originalQuery(parameters)
-      );
-      
-      // Fix plugins
+      window.chrome = { runtime: {} };
       Object.defineProperty(navigator, 'plugins', {
         get: () => [1, 2, 3, 4, 5]
       });
-      
-      // Fix languages
-      Object.defineProperty(navigator, 'languages', {
-        get: () => ['en-US', 'en']
-      });
     });
     
-    // Set viewport
-    await page.setViewport({ 
-      width: 1920, 
-      height: 1080 
-    });
+    // Set viewport and user agent
+    await page.setViewport({ width: 1920, height: 1080 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     
-    // Load cookies from session if exists
+    // Load cookies if session exists
     if (sessionId && sessionCache.has(sessionId)) {
       const cookies = sessionCache.get(sessionId);
       if (cookies && cookies.length > 0) {
         await page.setCookie(...cookies);
-        console.log(`🍪 Loaded ${cookies.length} cookies from session`);
+        console.log(`🍪 Using ${cookies.length} cookies`);
       }
     }
     
-    // Solve Cloudflare and get content
-    const result = await solveCloudflare(page, url);
+    // Fast bypass
+    const result = await fastCloudflareBypass(page, url);
     
-    // Save cookies to session
-    if (sessionId) {
-      const cookies = await page.cookies();
-      sessionCache.set(sessionId, cookies);
-      console.log(`💾 Saved ${cookies.length} cookies to session`);
+    if (result.success) {
+      // Save to cache
+      htmlCache.set(cacheKey, {
+        html: result.html,
+        url: result.url,
+        timestamp: Date.now()
+      });
+      
+      // Save cookies
+      if (sessionId) {
+        const cookies = await page.cookies();
+        sessionCache.set(sessionId, cookies);
+      }
+      
+      // Clean old cache
+      if (htmlCache.size > 50) {
+        const firstKey = htmlCache.keys().next().value;
+        htmlCache.delete(firstKey);
+      }
     }
     
     return result;
     
   } catch (error) {
-    console.error('Scraping error:', error);
     return {
       success: false,
       error: error.message
@@ -196,12 +185,12 @@ async function scrapeWithSession(url, sessionId = null) {
   }
 }
 
-// Main endpoint - FlareSolverr compatible
+// Main endpoint
 app.post('/v1', async (req, res) => {
   const startTime = Date.now();
   
   try {
-    const { cmd, url, maxTimeout = 60000, session } = req.body;
+    const { cmd, url, maxTimeout = 30000, session } = req.body;
     
     if (!url) {
       return res.status(400).json({
@@ -211,50 +200,44 @@ app.post('/v1', async (req, res) => {
     }
     
     console.log(`\n📨 Request: ${url}`);
-    console.log(`📦 Session: ${session || 'none'}`);
     
-    // Create session ID if provided
-    const sessionId = session || `session_${Date.now()}`;
+    const sessionId = session || `auto_${Buffer.from(url).toString('base64').substring(0, 10)}`;
     
     // Scrape with timeout
-    const resultPromise = scrapeWithSession(url, sessionId);
-    const timeoutPromise = new Promise((_, reject) => 
-      setTimeout(() => reject(new Error('Timeout')), maxTimeout)
-    );
-    
-    const result = await Promise.race([resultPromise, timeoutPromise]);
+    const result = await Promise.race([
+      scrapeWithCache(url, sessionId),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Timeout')), maxTimeout)
+      )
+    ]);
     
     if (result.success) {
       const elapsed = Date.now() - startTime;
-      console.log(`✅ Success in ${elapsed}ms`);
+      console.log(`✅ Total time: ${elapsed}ms ${result.fromCache ? '(from cache)' : ''}`);
       
       res.json({
         status: 'ok',
-        message: 'Success',
+        message: result.fromCache ? 'From cache' : 'Success',
         solution: {
-          url: result.url,
-          status: result.status,
+          url: result.url || url,
+          status: 200,
           response: result.html,
           cookies: [],
-          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          userAgent: 'Mozilla/5.0'
         },
         startTimestamp: startTime,
         endTimestamp: Date.now(),
-        version: '1.0.0'
+        version: '2.0.0'
       });
     } else {
       throw new Error(result.error);
     }
     
   } catch (error) {
-    console.error('Request failed:', error);
-    
     res.status(500).json({
       status: 'error',
       message: error.message,
-      solution: null,
-      startTimestamp: startTime,
-      endTimestamp: Date.now()
+      solution: null
     });
   }
 });
@@ -262,14 +245,15 @@ app.post('/v1', async (req, res) => {
 // Test endpoint
 app.get('/test', async (req, res) => {
   try {
-    const result = await scrapeWithSession('https://example.com');
+    const result = await scrapeWithCache('https://example.com');
     
     if (result.success) {
       const title = result.html.match(/<title>(.*?)<\/title>/)?.[1];
       res.json({
         status: 'ok',
         title: title || 'No title',
-        length: result.html.length
+        length: result.html.length,
+        fromCache: result.fromCache || false
       });
     } else {
       throw new Error(result.error);
@@ -283,27 +267,28 @@ app.get('/test', async (req, res) => {
   }
 });
 
-// Test Partsouq endpoint
+// Test Partsouq
 app.get('/test-partsouq', async (req, res) => {
   try {
-    console.log('\n🧪 Testing Partsouq...');
-    const result = await scrapeWithSession(
-      'https://partsouq.com/en/search/all?q=NLHBB51CBEZ258560',
-      'test_session_' + Date.now()
-    );
+    const vin = req.query.vin || 'NLHBB51CBEZ258560';
+    const url = `https://partsouq.com/en/search/all?q=${vin}`;
+    
+    console.log(`\n🧪 Testing Partsouq with VIN: ${vin}`);
+    
+    const result = await scrapeWithCache(url, `partsouq_${vin}`);
     
     if (result.success) {
-      // Check if we got real content
       const hasProducts = result.html.includes('product') || 
                          result.html.includes('part') ||
-                         result.html.includes('NLHBB51CBEZ258560');
+                         result.html.includes(vin);
       
       res.json({
         status: 'ok',
+        elapsed: result.elapsed + 'ms',
         length: result.html.length,
         hasProducts: hasProducts,
         url: result.url,
-        sample: result.html.substring(0, 500)
+        fromCache: result.fromCache || false
       });
     } else {
       throw new Error(result.error);
@@ -321,39 +306,69 @@ app.get('/test-partsouq', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
-    uptime: process.uptime(),
+    uptime: Math.round(process.uptime()) + 's',
     sessions: sessionCache.size,
-    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + ' MB'
+    htmlCache: htmlCache.size,
+    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB'
+  });
+});
+
+// Clear cache
+app.post('/clear-cache', (req, res) => {
+  const sessions = sessionCache.size;
+  const pages = htmlCache.size;
+  sessionCache.clear();
+  htmlCache.clear();
+  res.json({
+    status: 'ok',
+    cleared: {
+      sessions: sessions,
+      pages: pages
+    }
   });
 });
 
 // Root
 app.get('/', (req, res) => {
   res.send(`
-    <h1>🚀 Puppeteer Scraper with Cloudflare Bypass</h1>
-    <p>Endpoints:</p>
+    <h1>⚡ Fast Puppeteer Scraper v2</h1>
+    <p>Optimized for speed with caching</p>
     <ul>
-      <li>POST /v1 - Main scraping endpoint</li>
-      <li>GET /test - Test on example.com</li>
-      <li>GET /test-partsouq - Test on Partsouq</li>
-      <li>GET /health - Health check</li>
+      <li>POST /v1 - Main endpoint</li>
+      <li>GET /test - Test example.com</li>
+      <li>GET /test-partsouq - Test Partsouq</li>
+      <li>GET /health - System status</li>
+      <li>POST /clear-cache - Clear all caches</li>
     </ul>
+    <p>Cache: ${htmlCache.size} pages, ${sessionCache.size} sessions</p>
   `);
 });
 
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
-╔════════════════════════════════════════╗
-║   🚀 Cloudflare Bypass Scraper         ║
-║   Port: ${PORT}                            ║
-║   Mode: Stealth + Session Management   ║
-╚════════════════════════════════════════╝
+╔═══════════════════════════════════════╗
+║   ⚡ Fast Cloudflare Bypass v2        ║
+║   Port: ${PORT}                           ║
+║   Strategy: 3 attempts + Cache        ║
+╚═══════════════════════════════════════╝
   `);
 });
 
-// Clean old sessions every 5 minutes
+// Clean old cache periodically
 setInterval(() => {
+  let cleaned = 0;
+  const now = Date.now();
+  
+  // Clean HTML cache
+  for (const [key, value] of htmlCache) {
+    if (now - value.timestamp > CACHE_TTL) {
+      htmlCache.delete(key);
+      cleaned++;
+    }
+  }
+  
+  // Clean old sessions
   if (sessionCache.size > 100) {
     const toDelete = sessionCache.size - 50;
     let deleted = 0;
@@ -362,6 +377,10 @@ setInterval(() => {
       sessionCache.delete(key);
       deleted++;
     }
-    console.log(`🧹 Cleaned ${deleted} old sessions`);
+    cleaned += deleted;
   }
-}, 5 * 60 * 1000);
+  
+  if (cleaned > 0) {
+    console.log(`🧹 Cleaned ${cleaned} cache entries`);
+  }
+}, 60000); // Every minute
