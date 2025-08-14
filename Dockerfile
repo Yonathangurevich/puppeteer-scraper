@@ -1,31 +1,17 @@
-FROM node:18-slim
-
-# Install only Chromium - fast and simple
-RUN apt-get update && apt-get install -y \
-    chromium \
-    --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/*
+# Use pre-built image with Puppeteer!
+FROM ghcr.io/puppeteer/puppeteer:21.11.0
 
 WORKDIR /app
 
-# Copy all files
-COPY . .
+# Copy only server.js and package.json
+COPY package.json ./
+COPY server.js ./
 
-# Install dependencies (faster without switching user)
-RUN npm install --production --no-audit --no-fund
+# Install only express (Puppeteer already installed!)
+RUN npm install express
 
-# Create user after install
-RUN groupadd -r pptruser && useradd -r -g pptruser -G audio,video pptruser \
-    && mkdir -p /home/pptruser/Downloads \
-    && chown -R pptruser:pptruser /home/pptruser \
-    && chown -R pptruser:pptruser /app
-
-USER pptruser
-
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-ENV NODE_ENV=production
 ENV PORT=8080
+ENV NODE_ENV=production
 
 EXPOSE 8080
 
