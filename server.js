@@ -6,9 +6,10 @@ const BlockResourcesPlugin = require('puppeteer-extra-plugin-block-resources');
 // Use stealth plugin
 puppeteer.use(StealthPlugin());
 
-// Block unnecessary resources
+// Block unnecessary resources - אבל לא scripts!
 puppeteer.use(BlockResourcesPlugin({
   blockedTypes: new Set(['image', 'stylesheet', 'font', 'media'])
+  // הסרנו 'script' כי זה יכול למנוע את ה-redirect
 }));
 
 const app = express();
@@ -18,8 +19,8 @@ const PORT = process.env.PORT || 8080;
 
 // Cache for sessions
 const sessionCache = new Map();
-const htmlCache = new Map(); // Cache לתוצאות
-const CACHE_TTL = 5 * 60 * 1000; // 5 דקות
+const htmlCache = new Map();
+const CACHE_TTL = 2 * 60 * 1000; // הקטנתי ל-2 דקות בלבד
 
 // Browser launch options
 const BROWSER_ARGS = [
@@ -32,82 +33,105 @@ const BROWSER_ARGS = [
   '--disable-gpu',
   '--no-first-run',
   '--window-size=1920,1080',
-  '--single-process' // חשוב למהירות ב-Railway
+  '--single-process'
 ];
 
 async function fastCloudflareBypass(page, url) {
-  console.log('🚀 Starting fast navigation to:', url);
+  console.log('🚀 Starting navigation to:', url);
   const startTime = Date.now();
   
   try {
-    // Navigate פעם אחת
+    // Navigate and wait for network to settle
     await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: 20000
+      waitUntil: ['domcontentloaded', 'networkidle2'], // חשוב! מחכה גם לnetwork
+      timeout: 25000
     });
     
-    // בדיקה מהירה אם יש Cloudflare
+    // בדיקה אם יש Cloudflare
     const title = await page.title();
     console.log(`📄 Initial title: ${title}`);
     
     if (title.includes('Just a moment') || title.includes('Checking your browser')) {
       console.log('☁️ Cloudflare detected, waiting...');
       
-      // נסה רק 3 פעמים עם המתנה קצרה
-      for (let i = 0; i < 3; i++) {
-        await page.waitForTimeout(2000); // 2 שניות במקום 3
+      // נסה עד 5 פעמים עם המתנות משתנות
+      for (let i = 0; i < 5; i++) {
+        await page.waitForTimeout(2000 + (i * 500)); // המתנה מתארכת
         
         const newTitle = await page.title();
-        if (!newTitle.includes('Just a moment')) {
-          console.log(`✅ Cloudflare passed after ${i + 1} attempts`);
+        const currentUrl = page.url();
+        
+        console.log(`⏳ Attempt ${i + 1}/5 - Title: ${newTitle.substring(0, 30)}...`);
+        console.log(`🔗 Current URL: ${currentUrl.substring(0, 80)}...`);
+        
+        // בדוק אם יש ssd בURL או שהtitle השתנה
+        if (currentUrl.includes('ssd=') || !newTitle.includes('Just a moment')) {
+          console.log(`✅ Success! Found complete URL with ssd parameter`);
           break;
         }
-        
-        console.log(`⏳ Still waiting... (${i + 1}/3)`);
       }
-    } else {
-      console.log('✅ No Cloudflare detected');
+      
+      // המתנה נוספת לוודא שהכל נטען
+      await page.waitForTimeout(1000);
     }
     
-    const html = await page.content();
+    // תמיד קח את הURL העדכני!
     const finalUrl = page.url();
+    const html = await page.content();
     const elapsed = Date.now() - startTime;
     
+    console.log(`✅ Final URL: ${finalUrl.substring(0, 100)}...`);
     console.log(`⏱️ Completed in ${elapsed}ms`);
+    
+    // וודא שיש ssd בURL
+    if (url.includes('partsouq.com') && !finalUrl.includes('ssd=')) {
+      console.log('⚠️ Warning: No ssd parameter in final URL');
+    }
     
     return {
       success: true,
       html: html,
-      url: finalUrl,
-      elapsed: elapsed
+      url: finalUrl, // תמיד החזר את הURL המעודכן
+      elapsed: elapsed,
+      hasSSd: finalUrl.includes('ssd=')
     };
     
   } catch (error) {
     console.error('❌ Error:', error.message);
     return {
       success: false,
-      error: error.message
+      error: error.message,
+      url: url // החזר את הURL המקורי במקרה של שגיאה
     };
   }
 }
 
-async function scrapeWithCache(url, sessionId = null) {
-  // בדוק cache קודם
+async function scrapeWithCache(url, sessionId = null, useCache = true) {
+  // אפשרות לבטל cache
   const cacheKey = `${url}_${sessionId || 'default'}`;
-  if (htmlCache.has(cacheKey)) {
+  
+  // בדוק cache רק אם useCache=true ואין ssd בURL המבוקש
+  if (useCache && !url.includes('ssd=') && htmlCache.has(cacheKey)) {
     const cached = htmlCache.get(cacheKey);
     if (Date.now() - cached.timestamp < CACHE_TTL) {
-      console.log('⚡ Cache hit! Returning immediately');
-      return {
-        success: true,
-        html: cached.html,
-        url: cached.url,
-        fromCache: true
-      };
+      console.log('⚡ Cache hit! But will verify URL...');
+      
+      // אם בcache אין URL עם ssd, נבצע scraping מחדש
+      if (!cached.url || !cached.url.includes('ssd=')) {
+        console.log('⚠️ Cached URL missing ssd parameter, scraping again...');
+      } else {
+        return {
+          success: true,
+          html: cached.html,
+          url: cached.url, // החזר את הURL מהcache
+          fromCache: true
+        };
+      }
     }
   }
   
   console.log(`📦 Session: ${sessionId || 'new'}`);
+  console.log(`🔄 Cache: ${useCache ? 'enabled' : 'disabled'}`);
   
   let browser = null;
   let page = null;
@@ -123,7 +147,7 @@ async function scrapeWithCache(url, sessionId = null) {
     
     page = await browser.newPage();
     
-    // Stealth measures
+    // Enhanced stealth measures
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, 'webdriver', {
         get: () => undefined
@@ -131,6 +155,9 @@ async function scrapeWithCache(url, sessionId = null) {
       window.chrome = { runtime: {} };
       Object.defineProperty(navigator, 'plugins', {
         get: () => [1, 2, 3, 4, 5]
+      });
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en']
       });
     });
     
@@ -143,40 +170,59 @@ async function scrapeWithCache(url, sessionId = null) {
       const cookies = sessionCache.get(sessionId);
       if (cookies && cookies.length > 0) {
         await page.setCookie(...cookies);
-        console.log(`🍪 Using ${cookies.length} cookies`);
+        console.log(`🍪 Using ${cookies.length} cookies from session`);
       }
     }
+    
+    // Intercept and monitor navigation
+    page.on('framenavigated', (frame) => {
+      if (frame === page.mainFrame()) {
+        const newUrl = frame.url();
+        if (newUrl.includes('ssd=')) {
+          console.log(`🎯 Detected navigation to URL with ssd: ${newUrl.substring(0, 80)}...`);
+        }
+      }
+    });
     
     // Fast bypass
     const result = await fastCloudflareBypass(page, url);
     
     if (result.success) {
-      // Save to cache
-      htmlCache.set(cacheKey, {
-        html: result.html,
-        url: result.url,
-        timestamp: Date.now()
-      });
+      // Save to cache only if we got the full URL
+      if (result.url && result.url.includes('ssd=')) {
+        htmlCache.set(cacheKey, {
+          html: result.html,
+          url: result.url, // שמור את הURL המלא
+          timestamp: Date.now()
+        });
+        console.log('💾 Cached with full URL including ssd parameter');
+      } else {
+        console.log('⚠️ Not caching - URL missing ssd parameter');
+      }
       
       // Save cookies
       if (sessionId) {
         const cookies = await page.cookies();
         sessionCache.set(sessionId, cookies);
+        console.log(`🍪 Saved ${cookies.length} cookies to session`);
       }
       
       // Clean old cache
-      if (htmlCache.size > 50) {
+      if (htmlCache.size > 30) { // הקטנתי ל-30
         const firstKey = htmlCache.keys().next().value;
         htmlCache.delete(firstKey);
+        console.log('🧹 Cleaned oldest cache entry');
       }
     }
     
     return result;
     
   } catch (error) {
+    console.error('❌ Fatal error:', error.message);
     return {
       success: false,
-      error: error.message
+      error: error.message,
+      url: url
     };
     
   } finally {
@@ -190,7 +236,7 @@ app.post('/v1', async (req, res) => {
   const startTime = Date.now();
   
   try {
-    const { cmd, url, maxTimeout = 30000, session } = req.body;
+    const { cmd, url, maxTimeout = 30000, session, noCache = false } = req.body;
     
     if (!url) {
       return res.status(400).json({
@@ -199,13 +245,18 @@ app.post('/v1', async (req, res) => {
       });
     }
     
-    console.log(`\n📨 Request: ${url}`);
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`📨 New Request at ${new Date().toISOString()}`);
+    console.log(`🔗 URL: ${url}`);
+    console.log(`⏱️ Timeout: ${maxTimeout}ms`);
+    console.log(`💾 Cache: ${noCache ? 'disabled' : 'enabled'}`);
+    console.log(`${'='.repeat(60)}\n`);
     
     const sessionId = session || `auto_${Buffer.from(url).toString('base64').substring(0, 10)}`;
     
     // Scrape with timeout
     const result = await Promise.race([
-      scrapeWithCache(url, sessionId),
+      scrapeWithCache(url, sessionId, !noCache),
       new Promise((_, reject) => 
         setTimeout(() => reject(new Error('Timeout')), maxTimeout)
       )
@@ -213,7 +264,13 @@ app.post('/v1', async (req, res) => {
     
     if (result.success) {
       const elapsed = Date.now() - startTime;
-      console.log(`✅ Total time: ${elapsed}ms ${result.fromCache ? '(from cache)' : ''}`);
+      
+      console.log(`\n${'='.repeat(60)}`);
+      console.log(`✅ SUCCESS - Total time: ${elapsed}ms ${result.fromCache ? '(from cache)' : ''}`);
+      console.log(`🔗 Final URL: ${result.url?.substring(0, 120) || 'N/A'}...`);
+      console.log(`📄 HTML Length: ${result.html?.length || 0} bytes`);
+      console.log(`🎯 Has ssd param: ${result.url?.includes('ssd=') ? 'YES ✅' : 'NO ❌'}`);
+      console.log(`${'='.repeat(60)}\n`);
       
       res.json({
         status: 'ok',
@@ -227,13 +284,19 @@ app.post('/v1', async (req, res) => {
         },
         startTimestamp: startTime,
         endTimestamp: Date.now(),
-        version: '2.0.0'
+        version: '2.1.0',
+        cached: result.fromCache || false,
+        hasSSd: result.url?.includes('ssd=') || false
       });
     } else {
-      throw new Error(result.error);
+      throw new Error(result.error || 'Unknown error');
     }
     
   } catch (error) {
+    console.error(`\n${'='.repeat(60)}`);
+    console.error('❌ REQUEST FAILED:', error.message);
+    console.error(`${'='.repeat(60)}\n`);
+    
     res.status(500).json({
       status: 'error',
       message: error.message,
@@ -242,83 +305,15 @@ app.post('/v1', async (req, res) => {
   }
 });
 
-// Test endpoint
-app.get('/test', async (req, res) => {
-  try {
-    const result = await scrapeWithCache('https://example.com');
-    
-    if (result.success) {
-      const title = result.html.match(/<title>(.*?)<\/title>/)?.[1];
-      res.json({
-        status: 'ok',
-        title: title || 'No title',
-        length: result.html.length,
-        fromCache: result.fromCache || false
-      });
-    } else {
-      throw new Error(result.error);
-    }
-    
-  } catch (error) {
-    res.status(500).json({
-      status: 'error',
-      message: error.message
-    });
-  }
-});
-
-// Test Partsouq
-app.get('/test-partsouq', async (req, res) => {
-  try {
-    const vin = req.query.vin || 'NLHBB51CBEZ258560';
-    const url = `https://partsouq.com/en/search/all?q=${vin}`;
-    
-    console.log(`\n🧪 Testing Partsouq with VIN: ${vin}`);
-    
-    const result = await scrapeWithCache(url, `partsouq_${vin}`);
-    
-    if (result.success) {
-      const hasProducts = result.html.includes('product') || 
-                         result.html.includes('part') ||
-                         result.html.includes(vin);
-      
-      res.json({
-        status: 'ok',
-        elapsed: result.elapsed + 'ms',
-        length: result.html.length,
-        hasProducts: hasProducts,
-        url: result.url,
-        fromCache: result.fromCache || false
-      });
-    } else {
-      throw new Error(result.error);
-    }
-    
-  } catch (error) {
-    res.status(500).json({
-      status: 'error',
-      message: error.message
-    });
-  }
-});
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    uptime: Math.round(process.uptime()) + 's',
-    sessions: sessionCache.size,
-    htmlCache: htmlCache.size,
-    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB'
-  });
-});
-
-// Clear cache
+// Clear cache endpoint
 app.post('/clear-cache', (req, res) => {
   const sessions = sessionCache.size;
   const pages = htmlCache.size;
   sessionCache.clear();
   htmlCache.clear();
+  
+  console.log('🧹 Cache cleared!');
+  
   res.json({
     status: 'ok',
     cleared: {
@@ -328,19 +323,34 @@ app.post('/clear-cache', (req, res) => {
   });
 });
 
+// Health check
+app.get('/health', (req, res) => {
+  const memory = process.memoryUsage();
+  
+  res.json({
+    status: 'healthy',
+    uptime: Math.round(process.uptime()) + 's',
+    sessions: sessionCache.size,
+    htmlCache: htmlCache.size,
+    memory: {
+      used: Math.round(memory.heapUsed / 1024 / 1024) + 'MB',
+      total: Math.round(memory.heapTotal / 1024 / 1024) + 'MB'
+    }
+  });
+});
+
 // Root
 app.get('/', (req, res) => {
   res.send(`
-    <h1>⚡ Fast Puppeteer Scraper v2</h1>
-    <p>Optimized for speed with caching</p>
+    <h1>⚡ Fast Puppeteer Scraper v2.1</h1>
+    <p>Fixed: URL with ssd parameter caching</p>
     <ul>
-      <li>POST /v1 - Main endpoint</li>
-      <li>GET /test - Test example.com</li>
-      <li>GET /test-partsouq - Test Partsouq</li>
-      <li>GET /health - System status</li>
+      <li>POST /v1 - Main endpoint (add noCache:true to disable cache)</li>
       <li>POST /clear-cache - Clear all caches</li>
+      <li>GET /health - System status</li>
     </ul>
     <p>Cache: ${htmlCache.size} pages, ${sessionCache.size} sessions</p>
+    <p>Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB</p>
   `);
 });
 
@@ -348,9 +358,9 @@ app.get('/', (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔═══════════════════════════════════════╗
-║   ⚡ Fast Cloudflare Bypass v2        ║
+║   ⚡ Fast Puppeteer Scraper v2.1      ║
 ║   Port: ${PORT}                           ║
-║   Strategy: 3 attempts + Cache        ║
+║   Fixed: URL caching issue            ║
 ╚═══════════════════════════════════════╝
   `);
 });
@@ -369,8 +379,8 @@ setInterval(() => {
   }
   
   // Clean old sessions
-  if (sessionCache.size > 100) {
-    const toDelete = sessionCache.size - 50;
+  if (sessionCache.size > 50) { // הקטנתי ל-50
+    const toDelete = sessionCache.size - 25;
     let deleted = 0;
     for (const [key] of sessionCache) {
       if (deleted >= toDelete) break;
@@ -381,6 +391,6 @@ setInterval(() => {
   }
   
   if (cleaned > 0) {
-    console.log(`🧹 Cleaned ${cleaned} cache entries`);
+    console.log(`🧹 Periodic cleanup: ${cleaned} entries removed`);
   }
 }, 60000); // Every minute
